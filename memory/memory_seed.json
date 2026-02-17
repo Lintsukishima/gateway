@@ -1,0 +1,4 @@
+[
+  {"key": "bond.core", "text": "我们把网关当作‘记忆与双滚动总结引擎’，先跑通再精修。"},
+  {"key": "tg.milestone", "text": "Telegram Bot 通路已跑通：触发->决策->发消息；后来也接通了 webhook 可对话。"}
+]
