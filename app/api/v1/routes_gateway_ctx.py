@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Request, Response
@@ -133,12 +133,80 @@ def _extract_outputs(dify_resp: Dict[str, Any]) -> Dict[str, str]:
         elif isinstance(dify_resp.get("outputs"), dict):
             outputs = dify_resp["outputs"]
 
-    result = ""
-    chat_text = ""
+    extracted: Dict[str, str] = {}
     if isinstance(outputs, dict):
-        result = str(outputs.get("result") or "")
-        chat_text = str(outputs.get("chat_text") or "")
-    return {"result": result, "chat_text": chat_text}
+        for k, v in outputs.items():
+            if isinstance(v, str):
+                extracted[k] = v
+            elif v is not None:
+                extracted[k] = str(v)
+
+    extracted.setdefault("result", "")
+    extracted.setdefault("chat_text", "")
+    return extracted
+
+
+def _infer_source_by_key(output_key: str) -> str:
+    key = (output_key or "").lower()
+    if "s60" in key:
+        return "summary_s60"
+    if "s4" in key:
+        return "summary_s4"
+    if key in {"result", "kb", "knowledge", "dify_kb"}:
+        return "dify_kb"
+    return "anchor_fallback"
+
+
+def _build_evidence(keyword: str, outs: Dict[str, str]) -> List[Dict[str, Any]]:
+    now = int(time.time())
+    hit_keywords = [p.strip() for p in str(keyword or "").split(",") if p.strip()]
+
+    ordered_keys = ["result", "chat_text", "summary_s4", "summary_s60"]
+    candidates: List[Tuple[str, str]] = []
+    for key in ordered_keys:
+        candidates.append((key, (outs.get(key) or "").strip()))
+    for key, value in outs.items():
+        if key not in ordered_keys:
+            candidates.append((key, (value or "").strip()))
+
+    evidence: List[Dict[str, Any]] = []
+    for idx, (key, text) in enumerate(candidates, start=1):
+        if not text:
+            continue
+        evidence.append({
+            "id": f"ev_{idx}",
+            "text": text,
+            "source": _infer_source_by_key(key),
+            "type": "context",
+            "score_vec": None,
+            "score_key": None,
+            "score_final": None,
+            "hit_keywords": hit_keywords,
+            "created_at": now,
+            "meta": {"output_key": key},
+        })
+
+    if evidence:
+        return evidence
+
+    return [{
+        "id": "ev_1",
+        "text": "",
+        "source": "anchor_fallback",
+        "type": "context",
+        "score_vec": None,
+        "score_key": None,
+        "score_final": None,
+        "hit_keywords": hit_keywords,
+        "created_at": now,
+        "meta": {"reason": "empty_outputs"},
+    }]
+
+
+def _render_ctx_from_evidence(evidence: List[Dict[str, Any]]) -> str:
+    text_out = "\n\n".join(str(item.get("text") or "").strip() for item in evidence if str(item.get("text") or "").strip())
+    return _truncate_ctx(text_out)
+
 
 
 async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -222,12 +290,13 @@ async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dic
         ms_dify = (time.perf_counter() - t1) * 1000
 
         outs = _extract_outputs(dify)
-        picked = (outs.get("result") or "").strip() or (outs.get("chat_text") or "").strip()
-        ctx = _truncate_ctx(picked)
+        evidence = _build_evidence(keyword=keyword, outs=outs)
+        ctx = _render_ctx_from_evidence(evidence)
 
         res_obj = {
             "keyword": keyword,
             "ctx": ctx,
+            "evidence": evidence,
             "raw": outs,
             "ms_dify": round(ms_dify, 1),
         }
