@@ -157,11 +157,26 @@ def _infer_source_by_key(output_key: str) -> str:
     return "anchor_fallback"
 
 
+def _infer_type_by_key(output_key: str) -> str:
+    key = (output_key or "").lower()
+    if "s60" in key:
+        return "summary_s60"
+    if "s4" in key:
+        return "summary_s4"
+    return "anchor"
+
+
+def _fact_weight(ev_type: str) -> float:
+    if ev_type in {"summary_s4", "summary_s60"}:
+        return 1.35
+    return 1.0
+
+
 def _build_evidence(keyword: str, outs: Dict[str, str]) -> List[Dict[str, Any]]:
     now = int(time.time())
     hit_keywords = [p.strip() for p in str(keyword or "").split(",") if p.strip()]
 
-    ordered_keys = ["result", "chat_text", "summary_s4", "summary_s60"]
+    ordered_keys = ["summary_s4", "summary_s60", "result", "chat_text"]
     candidates: List[Tuple[str, str]] = []
     for key in ordered_keys:
         candidates.append((key, (outs.get(key) or "").strip()))
@@ -173,14 +188,16 @@ def _build_evidence(keyword: str, outs: Dict[str, str]) -> List[Dict[str, Any]]:
     for idx, (key, text) in enumerate(candidates, start=1):
         if not text:
             continue
+        ev_type = _infer_type_by_key(key)
         evidence.append({
             "id": f"ev_{idx}",
             "text": text,
             "source": _infer_source_by_key(key),
-            "type": "context",
+            "type": ev_type,
             "score_vec": None,
             "score_key": None,
             "score_final": None,
+            "W_fact": _fact_weight(ev_type),
             "hit_keywords": hit_keywords,
             "created_at": now,
             "meta": {"output_key": key},
@@ -193,10 +210,11 @@ def _build_evidence(keyword: str, outs: Dict[str, str]) -> List[Dict[str, Any]]:
         "id": "ev_1",
         "text": "",
         "source": "anchor_fallback",
-        "type": "context",
+        "type": "anchor",
         "score_vec": None,
         "score_key": None,
         "score_final": None,
+        "W_fact": 1.0,
         "hit_keywords": hit_keywords,
         "created_at": now,
         "meta": {"reason": "empty_outputs"},
@@ -206,6 +224,26 @@ def _build_evidence(keyword: str, outs: Dict[str, str]) -> List[Dict[str, Any]]:
 def _render_ctx_from_evidence(evidence: List[Dict[str, Any]]) -> str:
     text_out = "\n\n".join(str(item.get("text") or "").strip() for item in evidence if str(item.get("text") or "").strip())
     return _truncate_ctx(text_out)
+
+
+def _grounding_mode_from_evidence(evidence: List[Dict[str, Any]]) -> str:
+    if not evidence:
+        return "weak"
+    best_anchor = 0.0
+    best_summary = 0.0
+    for ev in evidence:
+        text = str(ev.get("text") or "").strip()
+        if not text:
+            continue
+        w_fact = float(ev.get("W_fact") or 1.0)
+        ev_type = str(ev.get("type") or "anchor")
+        if ev_type in {"summary_s4", "summary_s60"}:
+            best_summary = max(best_summary, w_fact)
+        else:
+            best_anchor = max(best_anchor, w_fact)
+    if best_summary >= 1.3 or best_anchor >= 1.0:
+        return "strong"
+    return "weak"
 
 
 
@@ -297,6 +335,7 @@ async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dic
             "keyword": keyword,
             "ctx": ctx,
             "evidence": evidence,
+            "grounding_mode": _grounding_mode_from_evidence(evidence),
             "raw": outs,
             "ms_dify": round(ms_dify, 1),
         }

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session as OrmSession
 from app.db.session import SessionLocal
 from app.db.models import SummaryS4, SummaryS60
 from app.services.chat_service import append_user_and_assistant
+from app.services.fact_constraints import build_fact_constraint_block
 
 router = APIRouter()
 
@@ -81,7 +82,7 @@ def _compact_summary_block(s4: Optional[Dict[str, Any]], s60: Optional[Dict[str,
     if not parts:
         return ""
     return (
-        "【Internal Memory摘要（仅用于你在心里对齐语气与上下文，不要在回复中提到“摘要/记忆/系统”）】\n"
+        "【Internal Memory摘要（仅用于事实/进展对齐，不用于模仿文风；不要在回复中提到“摘要/记忆/系统”）】\n"
         + "\n".join(parts)
         + "\n【End】"
     )
@@ -297,7 +298,7 @@ def _extract_keywords(text: str, k: int = 2) -> str:
 # -----------------------------
 # NEW: call local MCP gateway_ctx
 # -----------------------------
-async def _call_local_gateway_ctx(keyword: str, text: str, user: str) -> str:
+async def _call_local_gateway_ctx(keyword: str, text: str, user: str) -> Dict[str, Any]:
     req_id = uuid.uuid4().hex[:8]
     payload = {
         "jsonrpc": "2.0",
@@ -331,10 +332,11 @@ async def _call_local_gateway_ctx(keyword: str, text: str, user: str) -> str:
         content = res.get("content", []) or []
         if isinstance(content, list) and content:
             t = content[0].get("text", "")
-            return str(t or "").strip()
+            data_payload = res.get("data") if isinstance(res.get("data"), dict) else {}
+            return {"text": str(t or "").strip(), "data": data_payload}
     except Exception:
         pass
-    return ""
+    return {"text": "", "data": {}}
 
 def _build_anchor_system_block(snippet: str) -> str:
     snippet = (snippet or "").strip()
@@ -449,19 +451,28 @@ async def chat_completions(request: Request):
 
     # ✅ 统一入口：每轮强制走本机 MCP gateway_ctx，proxy 不再直连 Dify
     anchor_block = ""
+    fact_block = ""
+    grounding_mode = "weak"
     if ANCHOR_INJECT_ENABLED and FORCE_GATEWAY_EVERY_TURN:
         kw = _extract_keywords(user_text, k=2)
         # 使用稳定的会话标识，避免每次请求的 user 变化
         metadata = payload.get("metadata", {})
         stable_user = (metadata.get("gateway_user") or payload.get("user") or GATEWAY_CTX_USER)
-        ctx = await _call_local_gateway_ctx(keyword=kw, text=user_text, user=stable_user)
+        gateway_ctx = await _call_local_gateway_ctx(keyword=kw, text=user_text, user=stable_user)
+        ctx = str(gateway_ctx.get("text") or "")
+        debug_data = gateway_ctx.get("data") if isinstance(gateway_ctx.get("data"), dict) else {}
+        evidence = debug_data.get("evidence") if isinstance(debug_data.get("evidence"), list) else []
+        grounding_mode = str(debug_data.get("grounding_mode") or "weak")
         anchor_block = _build_anchor_system_block(ctx)
+        fact_block = build_fact_constraint_block(evidence, grounding_mode)
 
     system_blocks = []
     if s_block:
         system_blocks.append(s_block)
     if anchor_block:
         system_blocks.append(anchor_block)
+    if fact_block:
+        system_blocks.append(fact_block)
 
     messages2 = _inject_system(messages, system_blocks)
 
@@ -497,6 +508,7 @@ async def chat_completions(request: Request):
                 "X-Accel-Buffering": "no",
                 "X-Upstream-URL": upstream_url,
                 "X-Session-Id": session_id,
+                "X-Grounding-Mode": grounding_mode,
             },
         )
 
@@ -510,6 +522,7 @@ async def chat_completions(request: Request):
                 resp = JSONResponse({"error": {"message": r.text}}, status_code=r.status_code)
             resp.headers["x-upstream-url"] = upstream_url
             resp.headers["x-session-id"] = session_id
+            resp.headers["x-grounding-mode"] = grounding_mode
             return resp
 
         data = r.json()
@@ -540,4 +553,5 @@ async def chat_completions(request: Request):
     resp = JSONResponse(data)
     resp.headers["x-upstream-url"] = upstream_url
     resp.headers["x-session-id"] = session_id
+    resp.headers["x-grounding-mode"] = grounding_mode
     return resp
