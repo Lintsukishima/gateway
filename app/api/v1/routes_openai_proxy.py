@@ -19,6 +19,7 @@ from app.services.chat_service import append_user_and_assistant
 router = APIRouter()
 
 FORCE_GATEWAY_EVERY_TURN = os.getenv("FORCE_GATEWAY_EVERY_TURN", "1") == "1"
+GATEWAY_CTX_USER = os.getenv("GATEWAY_CTX_USER", "rikkahub").strip() or "rikkahub"
 ANCHOR_INJECT_ENABLED = os.getenv("ANCHOR_INJECT_ENABLED", "1") == "1"
 
 LOCAL_MCP_BASE = os.getenv("LOCAL_MCP_BASE", "http://127.0.0.1:8000").rstrip("/")
@@ -316,7 +317,7 @@ async def _call_local_gateway_ctx(keyword: str, text: str, user: str) -> str:
         "Content-Type": "application/json",
         "ngrok-skip-browser-warning": "1",
         # 让本机 gateway_ctx 按你现在兼容的版本返回
-        "MCP-Protocol-Version": os.getenv("MCP_PROTOCOL_VERSION", "2025-11-25"),
+        "MCP-Protocol-Version": os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18"),
     }
 
     async with httpx.AsyncClient(timeout=LOCAL_MCP_TIMEOUT) as client:
@@ -450,7 +451,10 @@ async def chat_completions(request: Request):
     anchor_block = ""
     if ANCHOR_INJECT_ENABLED and FORCE_GATEWAY_EVERY_TURN:
         kw = _extract_keywords(user_text, k=2)
-        ctx = await _call_local_gateway_ctx(keyword=kw, text=user_text, user=session_id)
+        # 使用稳定的会话标识，避免每次请求的 user 变化
+        metadata = payload.get("metadata", {})
+        stable_user = (metadata.get("gateway_user") or payload.get("user") or GATEWAY_CTX_USER)
+        ctx = await _call_local_gateway_ctx(keyword=kw, text=user_text, user=stable_user)
         anchor_block = _build_anchor_system_block(ctx)
 
     system_blocks = []

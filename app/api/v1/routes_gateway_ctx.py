@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
-
 JSON_UTF8 = "application/json; charset=utf-8"
 
 DIFY_BASE_URL = os.getenv("DIFY_BASE_URL", "https://api.dify.ai").strip()
@@ -16,10 +16,9 @@ DIFY_API_KEY = (os.getenv("DIFY_API_KEY") or os.getenv("DIFY_WORKFLOW_API_KEY") 
 DIFY_WORKFLOW_RUN_URL = os.getenv("DIFY_WORKFLOW_RUN_URL", "https://api.dify.ai/v1/workflows/run").strip()
 DIFY_WORKFLOW_ID_ANCHOR = os.getenv("DIFY_WORKFLOW_ID_ANCHOR", "").strip()
 
-# ✅ 默认降级：别用 2025-11-25，RikkaHub 很可能不支持
+# ✅ 默认别用 2025-11-25（你之前就被这个坑过）
 DEFAULT_MCP_PROTOCOL_VERSION = os.getenv("MCP_PROTOCOL_VERSION", "2025-06-18").strip()
 
-# ✅ 兼容集合（按需增删）
 SUPPORTED_VERSIONS = {
     "2025-11-25",
     "2025-06-18",
@@ -28,10 +27,21 @@ SUPPORTED_VERSIONS = {
     "2024-10-07",
 }
 
+# 原句截断长度（你可以在 .env 调）
 CTX_MAX = int(os.getenv("ANCHOR_SNIP_MAX", "400"))
-DIFY_TIMEOUT_SECS = float(os.getenv("DIFY_TIMEOUT_SECS", "60"))
+GATEWAY_CTX_DEBUG = os.getenv("GATEWAY_CTX_DEBUG", "0").strip().lower() in ("1", "true", "yes")
+DIFY_TIMEOUT_SECS = float(os.getenv("DIFY_TIMEOUT_SECS", "30"))
 
-_EMO_MARKERS = ["哥哥", "类", "喵", "猫咪", "小猫咪", "宝宝", "亲", "抱", "mua", "啾", "嘿嘿", "🥺", "😙", "😗", "😽", "😭", "🥰", "💖", "🖤"]
+# 轻量缓存（同 keyword 短时间重复调用就直接复用）
+CACHE_TTL_SECS = float(os.getenv("GATEWAY_CTX_CACHE_TTL", "20"))
+MAX_CACHE_SIZE = int(os.getenv("GATEWAY_CTX_CACHE_MAX", "256"))
+_cache: Dict[str, Tuple[float, str, Dict[str, Any]]] = {}
+
+_EMO_MARKERS = [
+    "哥哥", "类", "喵", "猫咪", "小猫咪", "宝宝", "亲", "抱", "mua", "啾", "嘿嘿",
+    "🥺", "😙", "😗", "😽", "😭", "🥰", "💖", "🖤",
+]
+
 
 def _jsonrpc_error(_id: Any, code: int, message: str, data: Any = None) -> Dict[str, Any]:
     err = {"code": code, "message": message}
@@ -39,29 +49,33 @@ def _jsonrpc_error(_id: Any, code: int, message: str, data: Any = None) -> Dict[
         err["data"] = data
     return {"jsonrpc": "2.0", "id": _id, "error": err}
 
+
 def _jsonrpc_result(_id: Any, result: Any) -> Dict[str, Any]:
     return {"jsonrpc": "2.0", "id": _id, "result": result}
 
+
 def _negotiate_protocol_version(request: Request, params: Dict[str, Any]) -> str:
-    # 1) initialize 里客户端会传 params.protocolVersion
     pv = str((params or {}).get("protocolVersion") or "").strip()
     if pv and pv in SUPPORTED_VERSIONS:
         return pv
 
-    # 2) HTTP header 里也可能带 MCP-Protocol-Version
     hv = (request.headers.get("MCP-Protocol-Version") or "").strip()
     if hv and hv in SUPPORTED_VERSIONS:
         return hv
 
-    # 3) 最后才用服务端默认
     return DEFAULT_MCP_PROTOCOL_VERSION if DEFAULT_MCP_PROTOCOL_VERSION in SUPPORTED_VERSIONS else "2025-06-18"
+
 
 def _mcp_wrap_text(res_obj: Dict[str, Any], text_out: str, is_error: bool) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": text_out or ""}], "isError": bool(is_error), "data": res_obj}
 
+
 def _is_emo_chitchat(text: str) -> bool:
     t = (text or "").strip()
+    if not t:
+        return False
     return any(m in t for m in _EMO_MARKERS)
+
 
 def _truncate_ctx(text: str) -> str:
     t = (text or "").strip().replace("\r", "")
@@ -71,13 +85,37 @@ def _truncate_ctx(text: str) -> str:
         return t
     return t[:CTX_MAX].rstrip() + "…"
 
+def _normalize_kw(keyword: str) -> str:
+    """Normalize keyword string to stabilize caching."""
+    kw = (keyword or "").strip()
+    if not kw:
+        return ""
+    # unify separators
+    kw = kw.replace("，", ",").replace(";", ",").replace("；", ",")
+    parts = [p.strip() for p in kw.split(",") if p.strip()]
+    # de-dup while preserving order
+    seen = set()
+    uniq = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return ",".join(uniq)
+
+
+
 async def _call_dify_anchor(keyword: str, user: str = "mcp") -> Dict[str, Any]:
     if not DIFY_API_KEY:
         raise RuntimeError("Missing env DIFY_API_KEY (or DIFY_WORKFLOW_API_KEY)")
 
     url = DIFY_WORKFLOW_RUN_URL or f"{DIFY_BASE_URL.rstrip('/')}/v1/workflows/run"
     headers = {"Authorization": f"Bearer {DIFY_API_KEY}", "Content-Type": "application/json"}
-    payload: Dict[str, Any] = {"inputs": {"keyword": keyword}, "response_mode": "blocking", "user": user}
+
+    payload: Dict[str, Any] = {
+        "inputs": {"keyword": keyword},
+        "response_mode": "blocking",
+        "user": user,
+    }
     if DIFY_WORKFLOW_ID_ANCHOR:
         payload["workflow_id"] = DIFY_WORKFLOW_ID_ANCHOR
 
@@ -85,6 +123,7 @@ async def _call_dify_anchor(keyword: str, user: str = "mcp") -> Dict[str, Any]:
         r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
         return r.json()
+
 
 def _extract_outputs(dify_resp: Dict[str, Any]) -> Dict[str, str]:
     outputs: Dict[str, Any] = {}
@@ -94,7 +133,13 @@ def _extract_outputs(dify_resp: Dict[str, Any]) -> Dict[str, str]:
         elif isinstance(dify_resp.get("outputs"), dict):
             outputs = dify_resp["outputs"]
 
-    return {"result": str(outputs.get("result") or ""), "chat_text": str(outputs.get("chat_text") or "")}
+    result = ""
+    chat_text = ""
+    if isinstance(outputs, dict):
+        result = str(outputs.get("result") or "")
+        chat_text = str(outputs.get("chat_text") or "")
+    return {"result": result, "chat_text": chat_text}
+
 
 async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     _id = msg.get("id", None)
@@ -102,14 +147,13 @@ async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dic
     params = (msg.get("params", {}) or {}) if isinstance(msg, dict) else {}
     is_notification = isinstance(msg, dict) and ("id" not in msg)
 
-    # ✅ 版本谈判：每个请求都算一次，initialize 最关键
     pv = _negotiate_protocol_version(request, params)
-    request.state.mcp_pv = pv  # 给外层响应 header 用
+    request.state.mcp_pv = pv
 
     if method == "initialize":
         result = {
             "protocolVersion": pv,
-            "serverInfo": {"name": "gateway_ctx", "version": "2.1"},
+            "serverInfo": {"name": "gateway_ctx", "version": "2.3"},
             "capabilities": {"tools": {}},
         }
         return None if is_notification else _jsonrpc_result(_id, result)
@@ -117,7 +161,7 @@ async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dic
     if method == "tools/list":
         tools = [{
             "name": "gateway_ctx",
-            "description": "Unified gateway context builder: keyword + Anchor RAG snippet (compact). Returns MCP content[].text + debug data.",
+            "description": "Unified gateway context builder: keyword + Anchor RAG snippet. Returns MCP content[].text + debug data.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -142,24 +186,72 @@ async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dic
     text = str(arguments.get("text") or "").strip()
     user = str(arguments.get("user") or "mcp").strip()
 
+    # 1) 先修 keyword（兜底 / 垃圾 kw）
     if not keyword:
-        # 兜底：至少别空
         keyword = "猫咪,哥哥" if _is_emo_chitchat(text) else "撒娇,哥哥"
 
+    # 如果你有 _is_garbage_kw，就在这里也加一层（可选）
     try:
+        if "_is_garbage_kw" in globals() and _is_garbage_kw(keyword):
+            keyword = "猫咪,哥哥" if _is_emo_chitchat(text) else "撒娇,哥哥"
+    except Exception:
+        pass
+
+    # 2) 再生成 cache_key（必须在 keyword 最终确定之后）
+    keyword = _normalize_kw(keyword)
+    cache_key = f"{user}||{keyword}"
+
+    t0 = time.perf_counter()
+    if GATEWAY_CTX_DEBUG:
+        print(f"[gateway_ctx] pid={os.getpid()} cache_size={len(_cache)} kw={keyword!r}")
+        print(f"[gateway_ctx] user={user!r} cache_key={cache_key!r} ttl={CACHE_TTL_SECS}")
+
+    # cache hit?
+    now = time.time()
+    hit = _cache.get(cache_key)
+    if hit and (now - hit[0] <= CACHE_TTL_SECS):
+        ctx, res_obj = hit[1], hit[2]
+        dt = (time.perf_counter() - t0) * 1000
+        print(f"[gateway_ctx] cache_hit kw={keyword!r} ms={dt:.1f} len={len(ctx)}")
+        return None if is_notification else _jsonrpc_result(_id, _mcp_wrap_text(res_obj, ctx, is_error=False))
+
+    # cache miss -> call dify
+    try:
+        t1 = time.perf_counter()
         dify = await _call_dify_anchor(keyword=keyword, user=user)
+        ms_dify = (time.perf_counter() - t1) * 1000
+
         outs = _extract_outputs(dify)
         picked = (outs.get("result") or "").strip() or (outs.get("chat_text") or "").strip()
         ctx = _truncate_ctx(picked)
-        res_obj = {"keyword": keyword, "ctx": ctx, "raw": outs}
+
+        res_obj = {
+            "keyword": keyword,
+            "ctx": ctx,
+            "raw": outs,
+            "ms_dify": round(ms_dify, 1),
+        }
+
+        # ✅ 写入缓存时用最新 now（更符合 TTL 语义）
+        _cache[cache_key] = (time.time(), ctx, res_obj)
+        # simple eviction (oldest-first) to cap memory
+        if len(_cache) > MAX_CACHE_SIZE:
+            oldest_key = min(_cache.items(), key=lambda kv: kv[1][0])[0]
+            _cache.pop(oldest_key, None)
+
+        ms_all = (time.perf_counter() - t0) * 1000
+        print(f"[gateway_ctx] miss kw={keyword!r} ms_all={ms_all:.1f} ms_dify={ms_dify:.1f} len={len(ctx)}")
         return None if is_notification else _jsonrpc_result(_id, _mcp_wrap_text(res_obj, ctx, is_error=False))
+
     except Exception as e:
+        ms_all = (time.perf_counter() - t0) * 1000
+        print(f"[gateway_ctx] ERROR kw={keyword!r} ms_all={ms_all:.1f} err={e}")
         res_obj = {"keyword": keyword, "error": str(e)}
         return None if is_notification else _jsonrpc_result(_id, _mcp_wrap_text(res_obj, str(e), is_error=True))
 
+
 @router.api_route("/gateway_ctx", methods=["GET", "POST", "OPTIONS"])
 async def gateway_ctx_mcp(request: Request):
-    # 默认 header 先给个保守版本
     default_pv = DEFAULT_MCP_PROTOCOL_VERSION if DEFAULT_MCP_PROTOCOL_VERSION in SUPPORTED_VERSIONS else "2025-06-18"
 
     if request.method in ("GET", "OPTIONS"):
@@ -172,14 +264,16 @@ async def gateway_ctx_mcp(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(_jsonrpc_error(None, -32700, "Parse error"), status_code=400, media_type=JSON_UTF8)
+        return JSONResponse(_jsonrpc_error(None, -32700, "Parse error"), headers={"MCP-Protocol-Version": default_pv}, media_type=JSON_UTF8)
 
+    # batch?
     if isinstance(body, list):
         results = []
-        for item in body:
-            r = await _handle_jsonrpc(request, item if isinstance(item, dict) else {})
-            if r is not None:
-                results.append(r)
+        for msg in body:
+            if isinstance(msg, dict):
+                r = await _handle_jsonrpc(request, msg)
+                if r is not None:
+                    results.append(r)
         pv = getattr(request.state, "mcp_pv", default_pv)
         return JSONResponse(results, headers={"MCP-Protocol-Version": pv}, media_type=JSON_UTF8)
 
