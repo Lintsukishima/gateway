@@ -8,6 +8,8 @@ import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
+from app.services.reranker import build_reranked_context_text, rerank_evidences
+
 router = APIRouter()
 JSON_UTF8 = "application/json; charset=utf-8"
 
@@ -31,6 +33,7 @@ SUPPORTED_VERSIONS = {
 CTX_MAX = int(os.getenv("ANCHOR_SNIP_MAX", "400"))
 GATEWAY_CTX_DEBUG = os.getenv("GATEWAY_CTX_DEBUG", "0").strip().lower() in ("1", "true", "yes")
 DIFY_TIMEOUT_SECS = float(os.getenv("DIFY_TIMEOUT_SECS", "30"))
+RERANK_TOPK = int(os.getenv("RERANK_TOPK", "5"))
 
 # 轻量缓存（同 keyword 短时间重复调用就直接复用）
 CACHE_TTL_SECS = float(os.getenv("GATEWAY_CTX_CACHE_TTL", "20"))
@@ -125,20 +128,33 @@ async def _call_dify_anchor(keyword: str, user: str = "mcp") -> Dict[str, Any]:
         return r.json()
 
 
-def _extract_outputs(dify_resp: Dict[str, Any]) -> Dict[str, str]:
+def _extract_outputs(dify_resp: Dict[str, Any]) -> Dict[str, Any]:
     outputs: Dict[str, Any] = {}
+    data_block: Dict[str, Any] = {}
     if isinstance(dify_resp, dict):
         if isinstance(dify_resp.get("data"), dict) and isinstance(dify_resp["data"].get("outputs"), dict):
+            data_block = dify_resp["data"]
             outputs = dify_resp["data"]["outputs"]
         elif isinstance(dify_resp.get("outputs"), dict):
             outputs = dify_resp["outputs"]
 
     result = ""
     chat_text = ""
+    evidences = []
     if isinstance(outputs, dict):
         result = str(outputs.get("result") or "")
         chat_text = str(outputs.get("chat_text") or "")
-    return {"result": result, "chat_text": chat_text}
+        if isinstance(outputs.get("evidences"), list):
+            evidences = outputs.get("evidences")
+        elif isinstance(outputs.get("evidence"), list):
+            evidences = outputs.get("evidence")
+        elif isinstance(outputs.get("documents"), list):
+            evidences = outputs.get("documents")
+
+    if not evidences and isinstance(data_block.get("retriever_resources"), list):
+        evidences = data_block.get("retriever_resources")
+
+    return {"result": result, "chat_text": chat_text, "evidences": evidences}
 
 
 async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -222,13 +238,20 @@ async def _handle_jsonrpc(request: Request, msg: Dict[str, Any]) -> Optional[Dic
         ms_dify = (time.perf_counter() - t1) * 1000
 
         outs = _extract_outputs(dify)
-        picked = (outs.get("result") or "").strip() or (outs.get("chat_text") or "").strip()
+        # 即使 Dify 已经启用混合检索 + 重排，网关仍做一层轻量二次重排，统一 S4/S60/多源规则。
+        reranked = rerank_evidences(
+            outs.get("evidences") or [],
+            top_k=RERANK_TOPK,
+        )
+        reranked_text = build_reranked_context_text(reranked)
+        picked = reranked_text or (outs.get("result") or "").strip() or (outs.get("chat_text") or "").strip()
         ctx = _truncate_ctx(picked)
 
         res_obj = {
             "keyword": keyword,
             "ctx": ctx,
             "raw": outs,
+            "reranked_evidences": reranked,
             "ms_dify": round(ms_dify, 1),
         }
 
