@@ -1,6 +1,7 @@
 import os
 import json
 import requests
+from typing import Any, Dict, Optional
 from datetime import datetime
 from fastapi import APIRouter, Request
 from zoneinfo import ZoneInfo
@@ -9,6 +10,7 @@ from app.db.session import SessionLocal
 from app.services.context_builder import build_context_pack
 from app.services.chat_service import append_user_and_assistant
 from app.services.anchor_rag import query_anchor_snippets, format_anchor_block
+from app.services.fact_constraints import build_fact_constraint_block
 
 router = APIRouter()
 
@@ -37,6 +39,41 @@ def _load_persona() -> str:
             return f.read().strip()
     except FileNotFoundError:
         return "你是一个在Telegram上聊天的助手，回复要像人类发消息，简洁自然，1-3句。"
+
+
+def _load_tg_rk_session_map() -> Dict[str, str]:
+    raw = os.getenv("TG_RK_SESSION_MAP_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        print(f"[warn] parse TG_RK_SESSION_MAP_JSON failed: {e}")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    out: Dict[str, str] = {}
+    for k, v in data.items():
+        key = str(k).strip()
+        val = str(v).strip()
+        if not key or not val:
+            continue
+        out[key] = val if val.startswith("rk:") else f"rk:{val}"
+    return out
+
+
+def _resolve_rk_session_id(chat_id: str) -> Optional[str]:
+    mapping = _load_tg_rk_session_map()
+    if chat_id in mapping:
+        return mapping[chat_id]
+
+    # 可选前缀映射：设置 TG_RK_FALLBACK_PREFIX=uid: 则 chat_id=123 映射为 rk:uid:123
+    fallback_prefix = os.getenv("TG_RK_FALLBACK_PREFIX", "").strip()
+    if fallback_prefix:
+        return f"rk:{fallback_prefix}{chat_id}"
+
+    return None
 
 
 # ===== Telegram sender =====
@@ -177,10 +214,25 @@ async def telegram_webhook(req: Request):
     finally:
         db.close()
 
+    # 2.1) 单向读取 RikkaHub 摘要（Telegram -> 只读 rk:*；RikkaHub 不读 tg:*）
+    rk_pack: Optional[Dict[str, Any]] = None
+    rk_session_id = _resolve_rk_session_id(chat_id)
+    if rk_session_id:
+        db = SessionLocal()
+        try:
+            rk_pack = build_context_pack(
+                db=db,
+                session_id=rk_session_id,
+                recent=0,
+            )
+        finally:
+            db.close()
+
     ctx_for_llm = _format_context_for_llm(pack, now_text=now_text)
 
     # 2.5) Anchor RAG（语气锚点）
     anchor_block = ""
+    snips: list[str] = []
     try:
         snips = query_anchor_snippets(
             user_text=text,
@@ -196,6 +248,42 @@ async def telegram_webhook(req: Request):
         print(f"[anchor_rag] first_snip={snips[0][:80]}")
     print(f"[anchor_rag] block_len={len(anchor_block)}")
 
+    # 2.6) 与 RikkaHub 共用事实约束规则（summary 优先于普通 anchor）
+    evidence: list[dict] = []
+    if rk_pack and rk_pack.get("s4", {}).get("summary"):
+        evidence.append({
+            "type": "summary_s4",
+            "W_fact": 1.35,
+            "text": json.dumps(rk_pack["s4"]["summary"], ensure_ascii=False),
+            "source": "rk",
+        })
+    if rk_pack and rk_pack.get("s60", {}).get("summary"):
+        evidence.append({
+            "type": "summary_s60",
+            "W_fact": 1.35,
+            "text": json.dumps(rk_pack["s60"]["summary"], ensure_ascii=False),
+            "source": "rk",
+        })
+    if pack.get("s4", {}).get("summary"):
+        evidence.append({
+            "type": "summary_s4",
+            "W_fact": 1.35,
+            "text": json.dumps(pack["s4"]["summary"], ensure_ascii=False),
+            "source": "tg",
+        })
+    if pack.get("s60", {}).get("summary"):
+        evidence.append({
+            "type": "summary_s60",
+            "W_fact": 1.35,
+            "text": json.dumps(pack["s60"]["summary"], ensure_ascii=False),
+            "source": "tg",
+        })
+    for snip in snips[:2]:
+        evidence.append({"type": "anchor", "W_fact": 1.0, "text": snip})
+
+    grounding_mode = "strong" if evidence else "weak"
+    fact_block = build_fact_constraint_block(evidence, grounding_mode)
+
 
     # 2.8) recent -> messages
     recent_msgs = _as_chat_messages_from_recent(
@@ -206,7 +294,7 @@ async def telegram_webhook(req: Request):
     # 3) 调用模型生成回复
     reply = call_chat_llm(
         user_text=text,
-        system_blocks=[ctx_for_llm, anchor_block],
+        system_blocks=[ctx_for_llm, anchor_block, fact_block],
         recent_messages=recent_msgs,
     )
 
