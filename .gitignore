@@ -1,7 +1,3 @@
-.env
-__pycache__/
-*.pyc
-gateway.db
-response.json
-recover/
 gateway _recover/
+recover/
+response.json
