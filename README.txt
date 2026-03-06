@@ -231,3 +231,27 @@ POST 到 `/api/v1/mcp/anchor_rag`，tool 名是 `anchor_rag`，arguments 至少�
 ---
 
 如果你愿意再省一次力：你只要告诉我——**RikkaHub 的 MCP 配置项是“填一个 URL”还是“可以填多个工具 URL”**（一句话），我就能在 README 里把“该填哪个 URL”写成最终答案；同时也能判断要不要做聚合 root（一个 URL 暴露两个工具）。你不想回也行，Codex 也能按第 8 节直接开干。
+
+---
+
+
+## 10. 上游配置自检（.env / OpenRouter / 最小请求）
+
+1. 在 `.env` 里确保下面两项**成对配置**（要么都填，要么都不填）：
+
+   * `UPSTREAM_BASE_URL`
+   * `UPSTREAM_API_KEY`
+
+2. 若使用 OpenRouter，建议：
+
+   * `UPSTREAM_BASE_URL=https://openrouter.ai/api/v1`
+   * `UPSTREAM_API_KEY=sk-or-v1-...`
+   * `UPSTREAM_MODEL` 设为该 key 有权限的模型
+
+3. 若不是 OpenRouter，请改成同平台的 base URL + key，避免“平台 A 的 key 打平台 B 的 URL”。
+
+4. 先跑最小请求 smoke test，确认 `/v1/chat/completions` 返回 200，再回 RikkaHub 联调：
+
+```bash
+./scripts/check_upstream.sh .env
+```
